@@ -1,5 +1,5 @@
 {
-  "name": "Digital Alchemist Scanner",
+  "name": "Digital Alchemist Scanner, fingascan",
   "description": "Real-time biometric scanner simulator using the device camera.",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": []
