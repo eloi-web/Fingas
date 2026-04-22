@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Code, Fingerprint, Aperture, Loader2, Download, Camera, AlertTriangle, RefreshCw } from 'lucide-react';
+import { Fingerprint, Aperture, Loader2, Download, Camera, AlertTriangle, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 export default function App() {
@@ -21,6 +21,8 @@ export default function App() {
   const SCAN_FRAMES = 90; // ~3s at 30fps
 
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Keep a ref of status to use inside the requestAnimationFrame loop
   useEffect(() => {
@@ -113,8 +115,8 @@ export default function App() {
             // Boost raw edge contrast heavily to extract faint patterns
             const edge = (edgeX + edgeY) * 2.0;
 
-            // Much lower threshold to pick up micro-contrast of blurry skin
-            const intensity = edge > 3 ? Math.min(255, edge * 15) : 0;
+            // Low threshold to pick up micro-contrast of blurry skin
+            const intensity = edge > 1 ? Math.min(255, edge * 20) : 0;
 
             // Map to Digital Alchemist Gold
             out[idx] = intensity;           // R
@@ -186,33 +188,8 @@ export default function App() {
     processFrame();
   };
 
-  const captureImage = () => {
-    if (status !== 'camera_ready' || !processingCanvasRef.current || !videoRef.current) return;
-
-    setErrorMessage('');
-
-    // --- Quality Check Phase ---
+  const startAccumulation = () => {
     const SIZE = 256;
-    const canvas = processingCanvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const imageData = ctx.getImageData(0, 0, SIZE, SIZE);
-    const data = imageData.data;
-
-    let significantEdges = 0;
-    for (let i = 0; i < data.length; i += 4) {
-      if (data[i] > 50) significantEdges++;
-    }
-
-    // Threshold is intentionally very low — a finger pressed to the lens is nearly uniform
-    // and will have few hard edges. We only reject completely blank/black frames.
-    if (significantEdges < (SIZE * SIZE) * 0.001) {
-      setErrorMessage('No signal detected. Ensure your finger covers the lens and there is some light, then try again.');
-      return;
-    }
-
-    // --- Init accumulation canvas ---
     const accumCanvas = document.createElement('canvas');
     accumCanvas.width = SIZE;
     accumCanvas.height = SIZE;
@@ -221,12 +198,24 @@ export default function App() {
     accumCtx.fillRect(0, 0, SIZE, SIZE);
     accumCanvasRef.current = accumCanvas;
     scanFrameCountRef.current = 0;
-
-    // Transition to scanning — the rAF loop handles accumulation and finalization
     setStatus('scanning');
   };
 
+  const scanNow = () => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setCountdown(null);
+    startAccumulation();
+  };
+
   const resetScan = () => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setCountdown(null);
     setStatus('idle');
     setCapturedImage(null);
     setErrorMessage('');
@@ -247,11 +236,47 @@ export default function App() {
     }
   }, [status]);
 
+  // Auto-countdown when camera is ready
+  useEffect(() => {
+    if (status !== 'camera_ready') {
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+      setCountdown(null);
+      return;
+    }
+
+    setCountdown(3);
+    let current = 3;
+    countdownIntervalRef.current = setInterval(() => {
+      current--;
+      if (current <= 0) {
+        clearInterval(countdownIntervalRef.current!);
+        countdownIntervalRef.current = null;
+        setCountdown(null);
+        startAccumulation();
+      } else {
+        setCountdown(current);
+      }
+    }, 1000);
+
+    return () => {
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+    };
+  }, [status]);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (animationFrameId.current) {
         cancelAnimationFrame(animationFrameId.current);
+      }
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
       }
       if (videoRef.current?.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
@@ -264,21 +289,18 @@ export default function App() {
     <div className="min-h-screen flex flex-col selection:bg-primary-container selection:text-on-primary-container overflow-x-hidden">
       {/* Header */}
       <header className="docked full-width top-0 sticky bg-transparent shadow-none z-50">
-        <div className="flex justify-between items-center w-full px-6 py-4 max-w-screen-2xl mx-auto font-headline tracking-tight">
+        <div className="flex justify-between items-center w-full px-6 py-4 max-w-screen-2xl mx-auto tracking-tight">
           <div className="flex items-center gap-4">
-            <span className="text-2xl font-black tracking-tighter text-primary-container border-2 border-primary-container px-3 py-1 rounded-sm shadow-[0_0_15px_rgba(255,204,0,0.2)]">
+            <span className="font-headline text-2xl tracking-tighter text-white px-3 py-1">
               FINGASCAN
             </span>
           </div>
-          <nav className="hidden md:flex items-center gap-6">
-            <div className="flex items-center gap-2">
-              <button
-                aria-label="code"
-                className="w-10 h-10 rounded-full flex items-center justify-center text-on-surface opacity-70 hover:text-primary hover:drop-shadow-[0_0_10px_rgba(255,204,0,0.5)] transition-all active:scale-95 duration-200 glass-panel border border-outline-variant/20"
-              >
-                <Code className="w-5 h-5" />
-              </button>
-            </div>
+          <nav className="flex gap-1 sm:gap-2 items-center font-headline tracking-tighter uppercase font-medium glass-panel px-2 sm:px-4 py-1.5 sm:py-2 rounded-full">
+            <a href="https://github.com/eloi-web" className="text-white hover:text-primary-container transition-colors flex items-center gap-2 px-2 sm:px-3 py-1.5 rounded-full disabled">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" className="bi bi-github" viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8"></path>
+              </svg>
+              <span className="hidden md:block text-sm">GitHub</span>
+            </a>
           </nav>
         </div>
       </header>
@@ -291,13 +313,15 @@ export default function App() {
           <section className="flex flex-col items-center gap-6 sm:gap-8 w-full max-w-md shrink-0">
             {/* Instruction Header */}
             <div className="text-center w-full relative mb-4">
-              <h2 className="font-headline text-3xl font-bold tracking-tight text-on-surface mb-2">
+              <h2 className="font-body text-3xl tracking-tight text-on-surface mb-2">
                 Initialize Sequence
               </h2>
               <p className="font-body text-sm sm:text-base text-on-surface-variant tracking-[0.01em]">
-                {status === 'camera_ready'
-                  ? "Hold your finger 2-4 inches from the camera for focus, or press tightly for an abstract read."
-                  : "Start the sequence to enable real-time tracking."}
+                {status === 'camera_ready' && countdown !== null
+                  ? `Scanning in ${countdown}... place your finger over the lens now.`
+                  : status === 'camera_ready'
+                    ? 'Position your finger and tap Scan Now.'
+                    : 'Start the sequence to enable real-time tracking.'}
               </p>
               <div className="absolute left-0 top-1/2 w-8 sm:w-12 h-px bg-surface-high -translate-y-1/2"></div>
               <div className="absolute right-0 top-1/2 w-8 sm:w-12 h-px bg-surface-high -translate-y-1/2"></div>
@@ -334,6 +358,24 @@ export default function App() {
                   <Fingerprint className="w-32 h-32 stroke-[0.5]" />
                 </div>
 
+                {/* Countdown overlay */}
+                <AnimatePresence mode="wait">
+                  {status === 'camera_ready' && countdown !== null && (
+                    <motion.div
+                      key={countdown}
+                      initial={{ opacity: 0, scale: 1.6 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.6 }}
+                      transition={{ duration: 0.3 }}
+                      className="absolute inset-0 flex items-center justify-center z-30 pointer-events-none"
+                    >
+                      <span className="font-body text-8xl font-black text-primary-container drop-shadow-[0_0_30px_rgba(255,204,0,0.9)]">
+                        {countdown}
+                      </span>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 {/* Animated Scanning Line (Only mounts during "scanning" state. Disappears in "complete") */}
                 <AnimatePresence>
                   {status === 'scanning' && (
@@ -363,22 +405,22 @@ export default function App() {
             </div>
 
             {/* Action Area */}
-            <div className="w-full max-w-70 mt-4 flex flex-col items-center">
+            <div className="font-body w-full max-w-70 mt-4 flex flex-col items-center">
               {errorMessage && (
                 <div className="w-full mb-4 px-4 py-3 rounded-lg border border-error/50 bg-error/10 text-error flex gap-2 items-start opacity-100 shadow-[0_0_15px_rgba(255,180,171,0.15)] animate-in fade-in slide-in-from-bottom-2">
                   <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
-                  <span className="text-[11px] leading-relaxed font-body">{errorMessage}</span>
+                  <span className="text-[11px] leading-relaxed">{errorMessage}</span>
                 </div>
               )}
 
               <button
                 onClick={
-                  (status === 'idle' || status === 'error' && !errorMessage.includes('quality'))
+                  (status === 'idle' || status === 'error')
                     ? initializeCamera
-                    : captureImage
+                    : scanNow
                 }
                 disabled={status === 'initializing' || status === 'scanning' || status === 'complete'}
-                className={`gold-gradient text-on-primary-container font-headline font-bold text-lg px-8 py-4 rounded-full flex items-center gap-3 transition-all duration-200 btn-hover-glow w-full justify-center shadow-lg 
+                className={`gold-gradient text-on-primary-container font-body text-lg px-8 py-4 rounded-full flex items-center gap-3 transition-all duration-200 btn-hover-glow w-full justify-center shadow-lg 
                   ${(status === 'initializing' || status === 'scanning' || status === 'complete')
                     ? 'opacity-80 scale-95 cursor-not-allowed grayscale-[0.2]'
                     : 'active:scale-95'}`}
@@ -386,11 +428,11 @@ export default function App() {
                 {status === 'initializing' && (
                   <><Loader2 className="w-6 h-6 animate-spin" /><span>Starting...</span></>
                 )}
-                {(status === 'idle' || (status === 'error' && !errorMessage.includes('quality'))) && (
+                {(status === 'idle' || status === 'error') && (
                   <><Camera className="w-6 h-6" /><span>Start Sequence</span></>
                 )}
-                {(status === 'camera_ready' || (status === 'error' && errorMessage.includes('quality'))) && (
-                  <><Aperture className="w-6 h-6 animate-pulse" /><span>Capture Frame</span></>
+                {status === 'camera_ready' && (
+                  <><Aperture className="w-6 h-6 animate-pulse" /><span>Scan Now</span></>
                 )}
                 {status === 'scanning' && (
                   <><Loader2 className="w-6 h-6 animate-spin" /><span>Extracting</span></>
@@ -400,13 +442,14 @@ export default function App() {
                 )}
               </button>
 
-              <div className="label-text text-[10px] text-primary-container opacity-60 mt-6 text-center h-4 tracking-[0.2em] font-semibold">
+              <div className="label-text text-[10px] text-white opacity-60 mt-6 text-center h-4 tracking-[0.2em]">
                 STATUS: {
                   status === 'idle' ? 'AWAITING_CAMERA' :
-                    (status === 'error' && !errorMessage.includes('quality')) ? 'CONNECTION_FAILED' :
-                      (status === 'camera_ready' || (status === 'error' && errorMessage.includes('quality'))) ? 'READY_FOR_LENS_INPUT' :
-                        status === 'scanning' ? 'EXTRACTING_PATTERN' :
-                          status === 'complete' ? 'VERIFIED' : 'CONNECTING_LENS'
+                    status === 'error' ? 'CONNECTION_FAILED' :
+                      status === 'camera_ready' && countdown !== null ? `SCANNING_IN_${countdown}` :
+                        status === 'camera_ready' ? 'READY_FOR_LENS_INPUT' :
+                          status === 'scanning' ? 'EXTRACTING_PATTERN' :
+                            status === 'complete' ? 'VERIFIED' : 'CONNECTING_LENS'
                 }
               </div>
             </div>
@@ -433,7 +476,7 @@ export default function App() {
                       <span className="label-text text-[10px] sm:text-xs text-on-surface-variant mb-1">
                         ANALYSIS COMPLETE
                       </span>
-                      <h3 className="font-headline text-4xl sm:text-5xl font-extrabold text-primary-container tracking-tighter leading-none uppercase drop-shadow-sm">
+                      <h3 className="font-body text-4xl sm:text-5xl font-extrabold text-primary-container tracking-tighter leading-none uppercase drop-shadow-sm">
                         GOT YOU
                       </h3>
                     </div>
