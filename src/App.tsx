@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Fingerprint, Loader2, Download, Camera, AlertTriangle, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 
 // Seeded PRNG (LCG) — same seed always produces the same pattern
 function makePrng(seed: number) {
@@ -120,6 +121,37 @@ export default function App() {
 
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
 
+  // MediaPipe hand detection
+  const handLandmarkerRef = useRef<HandLandmarker | null>(null);
+  const reticleRef = useRef<HTMLDivElement>(null);
+  const fingertipStableRef = useRef(0);
+  const cameraReadyFramesRef = useRef(0);
+  const scanStartedRef = useRef(false);
+
+  // Load the HandLandmarker model on mount (loads WASM + model from CDN)
+  useEffect(() => {
+    let hl: HandLandmarker | null = null;
+    FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+    ).then(vision =>
+      HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+          delegate: 'GPU',
+        },
+        runningMode: 'VIDEO',
+        numHands: 1,
+      })
+    ).then(landmarker => {
+      hl = landmarker;
+      handLandmarkerRef.current = landmarker;
+    }).catch(() => {
+      // Silently fail — fallback timer in processFrame handles it
+    });
+    return () => { hl?.close(); };
+  }, []);
+
   // Keep a ref of status to use inside the requestAnimationFrame loop
   useEffect(() => {
     statusRef.current = status;
@@ -181,11 +213,62 @@ export default function App() {
       }
 
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        const minDim = Math.min(video.videoWidth, video.videoHeight);
-        const startX = (video.videoWidth - minDim) / 2;
-        const startY = (video.videoHeight - minDim) / 2;
+        const vW = video.videoWidth;
+        const vH = video.videoHeight;
+        const minDim = Math.min(vW, vH);
 
-        ctx.drawImage(video, startX, startY, minDim, minDim, 0, 0, SIZE, SIZE);
+        // Default: center crop
+        let cropX = (vW - minDim) / 2;
+        let cropY = (vH - minDim) / 2;
+        let cropSize = minDim;
+
+        // --- MediaPipe hand detection (only in camera_ready phase) ---
+        if (statusRef.current === 'camera_ready' && handLandmarkerRef.current) {
+          try {
+            const results = handLandmarkerRef.current.detectForVideo(video, performance.now());
+            if (results.landmarks.length > 0) {
+              const tip = results.landmarks[0][8]; // index fingertip landmark
+              // Crop 60% of the frame centered on the detected fingertip
+              const cs = minDim * 0.6;
+              const tx = tip.x * vW;
+              const ty = tip.y * vH;
+              cropX = Math.max(0, Math.min(vW - cs, tx - cs / 2));
+              cropY = Math.max(0, Math.min(vH - cs, ty - cs / 2));
+              cropSize = cs;
+
+              // Update reticle via direct DOM (avoids React re-render on every frame)
+              // Mirror x because the video is displayed with scaleX(-1)
+              if (reticleRef.current) {
+                reticleRef.current.style.left = `${(1 - tip.x) * 100}%`;
+                reticleRef.current.style.top = `${tip.y * 100}%`;
+                reticleRef.current.style.opacity = '1';
+              }
+
+              fingertipStableRef.current++;
+              // Trigger scan after 8 consecutive frames with a detected fingertip
+              if (fingertipStableRef.current >= 8 && !scanStartedRef.current) {
+                scanStartedRef.current = true;
+                startAccumulation();
+              }
+            } else {
+              if (reticleRef.current) reticleRef.current.style.opacity = '0';
+              fingertipStableRef.current = 0;
+            }
+          } catch {
+            // Ignore detection errors
+          }
+        }
+
+        // Fallback: if no finger detected for ~5 seconds, start scanning anyway
+        if (statusRef.current === 'camera_ready') {
+          cameraReadyFramesRef.current++;
+          if (cameraReadyFramesRef.current >= 150 && !scanStartedRef.current) {
+            scanStartedRef.current = true;
+            startAccumulation();
+          }
+        }
+
+        ctx.drawImage(video, cropX, cropY, cropSize, cropSize, 0, 0, SIZE, SIZE);
 
         // Get image data and run full Sobel
         const imageData = ctx.getImageData(0, 0, SIZE, SIZE);
@@ -288,6 +371,10 @@ export default function App() {
     setErrorMessage('');
     accumCanvasRef.current = null;
     scanFrameCountRef.current = 0;
+    fingertipStableRef.current = 0;
+    cameraReadyFramesRef.current = 0;
+    scanStartedRef.current = false;
+    if (reticleRef.current) reticleRef.current.style.opacity = '0';
     if (videoRef.current?.srcObject) {
       const stream = videoRef.current.srcObject as MediaStream;
       stream.getTracks().forEach((track) => track.stop());
@@ -300,13 +387,6 @@ export default function App() {
       if (window.innerWidth < 1024) {
         resultRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
-    }
-  }, [status]);
-
-  // Start scanning immediately the moment the camera is ready — no countdown
-  useEffect(() => {
-    if (status === 'camera_ready') {
-      startAccumulation();
     }
   }, [status]);
 
@@ -359,8 +439,9 @@ export default function App() {
                   ? 'Hold your finger over the lens — building your pattern...'
                   : status === 'complete'
                     ? 'Scan complete. Your unique pattern is ready.'
-                    : 'Press Start, then cover the lens with your finger.'}
-              </p>
+                    : status === 'camera_ready'
+                      ? 'Point your index finger at the lens — scanning starts automatically.'
+                      : 'Press Start, then hold your index finger up to the lens.'}</p>
               <div className="absolute left-0 top-1/2 w-8 sm:w-12 h-px bg-surface-high -translate-y-1/2"></div>
               <div className="absolute right-0 top-1/2 w-8 sm:w-12 h-px bg-surface-high -translate-y-1/2"></div>
             </div>
@@ -414,6 +495,16 @@ export default function App() {
                 {(status === 'idle' || status === 'error') && (
                   <div className="absolute top-1/4 left-0 right-0 h-1 bg-primary-container shadow-[0_0_15px_#ffcc00] z-30 opacity-70 hidden group-hover:block transition-all duration-300"></div>
                 )}
+
+                {/* Fingertip detection reticle — position updated directly via ref (no re-renders) */}
+                <div
+                  ref={reticleRef}
+                  className="absolute w-8 h-8 -translate-x-1/2 -translate-y-1/2 pointer-events-none z-40 opacity-0 transition-opacity duration-150"
+                  style={{ left: '50%', top: '50%' }}
+                >
+                  <div className="w-full h-full rounded-full border-2 border-primary-container shadow-[0_0_12px_#ffcc00] animate-pulse" />
+                  <div className="absolute inset-[35%] rounded-full bg-primary-container" />
+                </div>
               </div>
 
               {/* Corner Reticles */}
@@ -460,9 +551,10 @@ export default function App() {
                 STATUS: {
                   status === 'idle' ? 'AWAITING_CAMERA' :
                     status === 'error' ? 'CONNECTION_FAILED' :
-                      (status === 'initializing' || status === 'camera_ready') ? 'CONNECTING_LENS' :
-                        status === 'scanning' ? 'EXTRACTING_PATTERN' :
-                          status === 'complete' ? 'VERIFIED' : 'AWAITING_CAMERA'
+                      status === 'initializing' ? 'CONNECTING_LENS' :
+                        status === 'camera_ready' ? 'DETECTING_FINGER' :
+                          status === 'scanning' ? 'EXTRACTING_PATTERN' :
+                            status === 'complete' ? 'VERIFIED' : 'AWAITING_CAMERA'
                 }
               </div>
             </div>
